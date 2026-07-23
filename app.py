@@ -11,6 +11,83 @@ from selenium.common.exceptions import ElementClickInterceptedException, WebDriv
 from selenium.webdriver.common.by import By
 from zoneinfo import ZoneInfo
 
+# ----- ddddocr 惰性加载：用于识别人机验证码 option 图上的文字 -----
+# ACLClouds 的点选验证码选项是图片，且 aria-label/alt 均无可读文字，
+# 文字匹配恒不命中。ddddocr 可 OCR 出 option 图里的品牌/服务名（如
+# "panel"/"serveur"/"discord"），再与挑战提示的目标词匹配。
+# 惰性加载 + 失败回退：未安装时不影响原有验证码流程。
+_DDDDOCR = None
+def _get_ocr():
+    global _DDDDOCR
+    if _DDDDOCR is None:
+        try:
+            import ddddocr
+            _DDDDOCR = ddddocr.DdddOcr(ocr=True, beta=True, show_ad=False)
+        except Exception as e:
+            print(f"ddddocr 初始化失败，验证码将回退到盲点模式: {e}")
+            _DDDDOCR = False  # 标记为不可用，避免每次重试
+    return _DDDDOCR or None
+
+def ocr_option_text(element):
+    """OCR 一个验证码 option 元素，返回识别到的文字（小写）。失败返回 ''。"""
+    ocr = _get_ocr()
+    if not ocr:
+        return ''
+    try:
+        # 优先取 option 内 <img> 的截图字节，最适合 ddddocr 直接识别
+        try:
+            img = element.find_element(By.TAG_NAME, 'img')
+            png = img.screenshot_as_png
+        except Exception:
+            # 退路：对整个 option 元素截图
+            png = element.screenshot_as_png
+        if not png:
+            return ''
+        text = ocr.classification(png)
+        return (text or '').strip().lower()
+    except Exception as e:
+        print(f"OCR option 失败: {e}")
+        return ''
+
+def match_option_by_text(options, target):
+    """在三源文字（option.text / img.alt / aria-label）里匹配 target。
+    命中返回该 option，否则返回 None。"""
+    if not target:
+        return None
+    target_lower = target.lower()
+    for opt in options:
+        opt_text = (opt.text or '').strip()
+        if not opt_text:
+            try:
+                img = opt.find_element(By.TAG_NAME, 'img')
+                opt_text = (img.get_attribute('alt') or '').strip()
+            except Exception:
+                pass
+        if not opt_text:
+            try:
+                opt_text = (opt.get_attribute('aria-label') or '').strip()
+            except Exception:
+                pass
+        if opt_text and target_lower in opt_text.lower():
+            return opt
+    return None
+
+def match_option_by_ocr(options, target):
+    """当三源文字匹配不到时，用 ddddocr 对各 option 图 OCR 后匹配 target。
+    命中返回该 option，否则返回 None。"""
+    if not target:
+        return None
+    target_lower = target.lower().strip()
+    ocr = _get_ocr()
+    if not ocr:
+        return None
+    for opt in options:
+        ocr_text = ocr_option_text(opt)
+        if ocr_text and target_lower in ocr_text:
+            print(f"OCR 命中: target={target!r}, option 文字='{ocr_text}'")
+            return opt
+    return None
+
 # ----- 配置（从环境变量读取或在双引号内填写） -----
 EMAIL = os.getenv('EMAIL') or ""
 PASSWORD = os.getenv('PASSWORD') or ""
@@ -566,22 +643,12 @@ def handle_captcha_challenge(sb, label='验证码', timeout=20):
 
     matched = None
     if target:
-        for opt in options:
-            opt_text = (opt.text or '').strip()
-            if not opt_text:
-                try:
-                    img = opt.find_element(By.TAG_NAME, 'img')
-                    opt_text = (img.get_attribute('alt') or '').strip()
-                except Exception:
-                    pass
-            if not opt_text:
-                try:
-                    opt_text = (opt.get_attribute('aria-label') or '').strip()
-                except Exception:
-                    pass
-            if target.lower() in opt_text.lower():
-                matched = opt
-                break
+        matched = match_option_by_text(options, target)
+        if matched is None:
+            # 文字 attr 全不命中（多为纯图片 option）→ OCR 兜底
+            matched = match_option_by_ocr(options, target)
+            if matched is None:
+                print(f"{label} 首次匹配均未命中目标 {target!r}，进入重试循环")
 
     attempts = 0
     max_attempts = 8
@@ -610,24 +677,13 @@ def handle_captcha_challenge(sb, label='验证码', timeout=20):
 
         candidate = None
         if target and current_target and current_target.lower() == target.lower():
-            for opt in options:
-                opt_text = (opt.text or '').strip()
-                if not opt_text:
-                    try:
-                        img = opt.find_element(By.TAG_NAME, 'img')
-                        opt_text = (img.get_attribute('alt') or '').strip()
-                    except Exception:
-                        pass
-                if not opt_text:
-                    try:
-                        opt_text = (opt.get_attribute('aria-label') or '').strip()
-                    except Exception:
-                        pass
-                if target.lower() in opt_text.lower():
-                    candidate = opt
-                    break
+            candidate = match_option_by_text(options, target)
+            if candidate is None:
+                candidate = match_option_by_ocr(options, target)
 
         if candidate is None:
+            # 连续 8 次都匹配不到 → 兜底点第一个（与原有行为一致），并提示
+            print(f"{label} 多源匹配未命中目标 {current_target or target!r}，兜底点 options[0]")
             candidate = options[0]
 
         print(f"{label} 点击候选选项 #{attempts + 1} ...")
