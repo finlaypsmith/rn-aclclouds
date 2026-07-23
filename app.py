@@ -119,16 +119,16 @@ def dedupe_project_cards(cards):
 
         duplicate = False
         for kept in list(keep):
-            kept_text = element_text(kept)
+            # 两个候选存在祖先/后代关系时，保留更靠外、信息更完整的那一个
+            # （通常是 .client-card 外壳卡，而非其 .projects-card-expiry 等内层块）。
             if element_contains(kept, card):
+                # kept 把 card 整个包住 → 说明 card 是内层子块，丢弃 card
                 duplicate = True
                 break
             if element_contains(card, kept):
-                if len(card_text) > len(kept_text):
-                    keep.remove(kept)
-                else:
-                    duplicate = True
-                break
+                # card 把 kept 包住 → 删掉内层旧项，由外层 card 取代
+                keep.remove(kept)
+                continue
 
         if not duplicate:
             keep.append(card)
@@ -192,10 +192,12 @@ def find_card_container_from_child(sb, child):
 
 def find_project_cards(sb):
     candidate_selectors = [
+        # 主锚点：精确 class token「client-card」只命中卡片外壳，
+        # 不会命中内部的 .projects-card-expiry / .projects-card-stats 等子块，
+        # 也不会命中外层 .content-grid.projects-cards-grid 容器。
+        '.client-card',
+        '.client-card[class*="projects-card-"]',
         '.projects-card',
-        '[class*="projects-card"]',
-        '[class*="project"][class*="card"]',
-        '[class*="Project"][class*="Card"]',
         '[class*="service"][class*="card"]',
         '[class*="server"][class*="card"]',
         'article',
