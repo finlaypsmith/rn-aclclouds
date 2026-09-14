@@ -95,7 +95,7 @@ TG_CHAT_ID = os.getenv('TG_CHAT_ID') or ""
 TG_BOT_TOKEN = os.getenv('TG_BOT_TOKEN') or ""
 
 LOGIN_PATH = '/auth/login'
-BASE_URL = 'https://dash.aclclouds.com'
+BASE_URL = 'https://aclclouds.com'
 PROJECTS_URL = f'{BASE_URL}/dashboard/projects'
 
 def beijing_time_str():
@@ -233,10 +233,15 @@ def find_elements(root, selector):
     return root.find_elements(by, selector)
 
 def find_renew_buttons(root):
+    # 新版页面：Renew 按钮为 client-btn 系列（Renew --primary / Delete --danger），
+    # Manage 链接也是 client-btn--primary，因此按文本过滤避免误点。
     selectors = [
         '.projects-renew-btn',
+        'a.client-btn--primary',
+        'button.client-btn--primary',
         './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
         './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "reactivate")]',
+        './/a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
         './/*[(@role="button" or self::a) and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
         './/*[(@role="button" or self::a) and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "reactivate")]',
     ]
@@ -246,7 +251,21 @@ def find_renew_buttons(root):
             buttons.extend(find_elements(root, selector))
         except Exception:
             continue
-    return unique_elements([button for button in buttons if element_text(button) or button.is_displayed()])
+
+    def is_renew_like(button):
+        try:
+            if 'projects-renew-btn' in (button.get_attribute('class') or ''):
+                return True
+        except Exception:
+            pass
+        label = ' '.join(filter(None, [
+            element_text(button),
+            (button.get_attribute('aria-label') or ''),
+            (button.get_attribute('title') or ''),
+        ]))
+        return bool(re.search(r'renew|reactivate|续期|延长|prolong', label, re.I))
+
+    return unique_elements([b for b in buttons if is_renew_like(b)])
 
 def find_card_container_from_child(sb, child):
     return sb.driver.execute_script(
@@ -268,23 +287,29 @@ def find_card_container_from_child(sb, child):
     )
 
 def find_project_cards(sb):
+    # 2026-09 改版：卡片根元素是 main 下的 <article>（ProjectsPage-module_* hash class，
+    # class 名不稳定，不能依赖）。过期信息在 Details 展开的 [id^="service-details"] 里。
     candidate_selectors = [
-        # 主锚点：精确 class token「client-card」只命中卡片外壳，
-        # 不会命中内部的 .projects-card-expiry / .projects-card-stats 等子块，
-        # 也不会命中外层 .content-grid.projects-cards-grid 容器。
+        'main article',
+        'article',
         '.client-card',
         '.client-card[class*="projects-card-"]',
         '.projects-card',
         '[class*="service"][class*="card"]',
         '[class*="server"][class*="card"]',
-        'article',
     ]
     cards = []
     for selector in candidate_selectors:
         try:
             for card in sb.driver.find_elements(By.CSS_SELECTOR, selector):
-                text = element_text(card).lower()
-                if any(keyword in text for keyword in ['renew', 'reactivate', 'suspended', 'expiry', 'expire', 'valid', '续期', '重新激活', '恢复', '暂停', '过期', '到期']):
+                # 命中校验：卡片内要有项目标题或过期/续期相关文本，
+                # 避免把整页容器、通知块等误判为卡片
+                text = element_text(card)
+                if not text or len(text) > 800:
+                    continue
+                has_title = bool(card.find_elements(By.CSS_SELECTOR, 'h3'))
+                has_expiry_kw = any(keyword in text.lower() for keyword in ['renew', 'reactivate', 'suspended', 'expiry', 'expire', 'valid', '续期', '重新激活', '恢复', '暂停', '过期', '到期'])
+                if has_title or has_expiry_kw:
                     cards.append(card)
         except Exception:
             continue
@@ -352,11 +377,12 @@ def extract_duration_like(text):
     return ''
 
 def get_project_name(card, idx):
+    # 新版页面：卡片标题是 card 内的 <h3>（如 "appa"）
     selectors = [
+        'h3',
         '.projects-card-title',
         'h1',
         'h2',
-        'h3',
         'h4',
         '[class*="title"]',
         '[class*="name"]',
@@ -377,7 +403,10 @@ def get_project_name(card, idx):
     return f"项目 #{idx}"
 
 def get_project_expiry(card):
+    # 新版页面：过期信息（"Expires in 3j 23h"）在 Details 展开的
+    # [id^="service-details"] 区块里；未到续期时间时只有该提示行。
     selectors = [
+        '[id^="service-details"]',
         '.projects-expiry-value',
         '[class*="expiry"]',
         '[class*="expire"]',
@@ -409,6 +438,7 @@ def get_renewal_available_note(card):
     text = element_text(card)
     patterns = [
         r'Renewal\s+will\s+be\s+available[^\n]*',
+        r'La\s+prolongation\s+sera\s+possible[^\n]*',
         r'可续期[^\n]*',
         r'续期[^\n]*前[^\n]*',
     ]
@@ -438,6 +468,12 @@ def wait_for_renew_result(sb, idx, timeout=30):
 
             card = get_card_by_index(sb, idx)
             if card:
+                # 新版页面：续期成功后 Details 区块的 "Renewal will be available"
+                # 提示会消失（或被新过期时间取代），同时卡片内不再有 renew 按钮
+                sb.driver.execute_script('''
+                    document.querySelectorAll('main article button[aria-controls^="service-details"]')
+                      .forEach(btn => { if (btn.getAttribute('aria-expanded') === 'false') btn.click(); });
+                ''')
                 renewal_note = get_renewal_available_note(card)
                 renew_buttons = find_renew_buttons(card)
                 if renewal_note and not renew_buttons:
@@ -454,6 +490,7 @@ def wait_for_renew_result(sb, idx, timeout=30):
 
 def get_renew_note(card):
     selectors = [
+        '[id^="service-details"]',
         '.projects-renew-note',
         '[class*="renew-note"]',
         '[class*="note"]',
@@ -949,7 +986,16 @@ def main():
         sb.wait_for_ready_state_complete()
         time.sleep(3)
 
-        # 3. 定位卡片
+        # 3. 定位卡片（新版页面过期信息在 Details 折叠区里，先全部展开）
+        try:
+            sb.driver.execute_script('''
+                document.querySelectorAll('main article button[aria-controls^="service-details"]')
+                  .forEach(btn => { if (btn.getAttribute('aria-expanded') === 'false') btn.click(); });
+            ''')
+            time.sleep(1)
+        except Exception as e:
+            print(f"展开 Details 失败（忽略）: {e}")
+
         cards = find_project_cards(sb)
 
         if not cards:
