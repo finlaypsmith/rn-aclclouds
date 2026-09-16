@@ -129,8 +129,10 @@ def is_login_page(sb):
     return LOGIN_PATH in sb.get_current_url()
 
 def is_logged_in(sb):
+    # 必须在 dashboard 路径才算已登录：落地页（如法语 /fr/）同样属于
+    # BASE_URL 且不含 /auth/login，不能据此认为已登录
     current_url = sb.get_current_url()
-    return BASE_URL in current_url and LOGIN_PATH not in current_url
+    return BASE_URL in current_url and '/dashboard' in current_url and LOGIN_PATH not in current_url
 
 def scroll_to_selector(sb, selector):
     sb.scroll_to(selector)
@@ -914,8 +916,11 @@ def login(sb, email, password):
     # ---- 等待登录结果 ----
     try:
         wait_for_url_change(sb, login_page_url, timeout=30)
-        if '/auth/login' not in sb.get_current_url():
-            sb.assert_title('Home | ACLClouds')
+        current_url = sb.get_current_url()
+        if '/auth/login' not in current_url:
+            # 法语环境下标题是法语版（非 "Home | ACLClouds"），
+            # 以 URL 路径为准，标题仅打印不作为判据
+            print(f"登录后 URL: {current_url}, 标题: {sb.get_title()}")
             print("✅ 登录成功！")
             return True
         else:
@@ -962,10 +967,13 @@ def main():
 
         sb.set_window_size(1366, 768)
 
-        if not is_login_page(sb):
-            sb.open(BASE_URL)
-            sb.wait_for_ready_state_complete()
-            time.sleep(2)
+        # 直接进项目页：未登录会被站点重定向到 /auth/login；
+        # 已登录（cookie 有效）则直接停在项目页。
+        # 注意不能先开 BASE_URL 判断——新版未登录时落在 /fr/ 落地页，
+        # 既不是登录页也不是 dashboard。
+        sb.open(PROJECTS_URL)
+        sb.wait_for_ready_state_complete()
+        time.sleep(2)
 
         if is_login_page(sb):
             if not EMAIL or not PASSWORD:
@@ -974,19 +982,18 @@ def main():
                 return
             if not login(sb, EMAIL, PASSWORD):
                 return
-        elif is_logged_in(sb):
-            print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-        else:
+            # 登录成功后重新进入项目页
+            sb.open(PROJECTS_URL)
+            sb.wait_for_ready_state_complete()
+            time.sleep(2)
+        elif not is_logged_in(sb):
             print(f"❌ 未能确认登录状态。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
             send_telegram("⚠️ 未能确认登录状态，请检查账号密码配置。")
             return
+        else:
+            print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
 
-        # 2. 进入项目页
-        sb.open(PROJECTS_URL)
-        sb.wait_for_ready_state_complete()
-        time.sleep(3)
-
-        # 3. 定位卡片（新版页面过期信息在 Details 折叠区里，先全部展开）
+        # 2. 定位卡片（新版页面过期信息在 Details 折叠区里，先全部展开）
         try:
             sb.driver.execute_script('''
                 document.querySelectorAll('main article button[aria-controls^="service-details"]')
