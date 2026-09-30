@@ -177,170 +177,80 @@ def unique_elements(elements):
         unique.append(element)
     return unique
 
-def element_contains(parent, child):
-    if parent == child:
-        return True
-    try:
-        return parent.find_elements(By.XPATH, './/*').count(child) > 0
-    except Exception:
-        return False
+# 站点按 IP / 浏览器语言切换文案，按钮和提示语都不固定，统一用多语言匹配。
+RENEW_LABEL_PATTERN = re.compile(
+    r'renew|renouvel|erneuern|renovar|rinnov|продлить|reactivate|续期|延长|重新激活',
+    re.I,
+)
 
-def dedupe_project_cards(cards):
-    cards = unique_elements(cards)
-    if not cards:
-        return []
+# 2026-09 版续期人机验证弹窗：固定带这个 aria-labelledby，与语言无关
+RENEW_CAPTCHA_DIALOG = 'div[role="dialog"][aria-labelledby="renew-captcha-title"]'
 
-    keep = []
-    for card in cards:
-        card_text = element_text(card)
-        if len(card_text) < 3:
-            continue
-
-        duplicate = False
-        for kept in list(keep):
-            # 两个候选存在祖先/后代关系时，保留更靠外、信息更完整的那一个
-            # （通常是 .client-card 外壳卡，而非其 .projects-card-expiry 等内层块）。
-            if element_contains(kept, card):
-                # kept 把 card 整个包住 → 说明 card 是内层子块，丢弃 card
-                duplicate = True
-                break
-            if element_contains(card, kept):
-                # card 把 kept 包住 → 删掉内层旧项，由外层 card 取代
-                keep.remove(kept)
-                continue
-
-        if not duplicate:
-            keep.append(card)
-
-    deduped = []
-    seen_signatures = set()
-    for card in keep:
-        text = element_text(card)
-        name = ''
-        for line in text.splitlines():
-            line = line.strip()
-            if line and not re.search(r'expires|renewal|renew|reactivate|suspended|expiry|expire|valid|续期|重新激活|恢复|暂停|过期|到期', line, re.I):
-                name = line
-                break
-        signature = (name.lower(), get_project_expiry(card).lower())
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
-        deduped.append(card)
-
-    return deduped
-
-def find_elements(root, selector):
-    by = By.XPATH if selector.startswith(('/', './/')) else By.CSS_SELECTOR
-    return root.find_elements(by, selector)
+# 服务行里这些行不是服务名：状态/续期方式/过期提示等
+NOISE_LINE_PATTERN = re.compile(
+    r'renew|renouvel|expires|expiry|expire|suspended|valid|automatic|active|custom name|'
+    r'service id|effective date|renewal|detail|support|invoice|cancel|storage|cpu|ram|'
+    r'续期|重新激活|恢复|暂停|过期|到期|自动|有效',
+    re.I,
+)
 
 def find_renew_buttons(root):
-    # 新版页面：Renew 按钮为 client-btn 系列（Renew --primary / Delete --danger），
-    # Manage 链接也是 client-btn--primary，因此按文本过滤避免误点。
-    selectors = [
-        '.projects-renew-btn',
-        'a.client-btn--primary',
-        'button.client-btn--primary',
-        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
-        './/button[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "reactivate")]',
-        './/a[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
-        './/*[(@role="button" or self::a) and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]',
-        './/*[(@role="button" or self::a) and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "reactivate")]',
-    ]
+    """在服务行里找「续期」按钮。
+
+    2026-09 表格版：续期按钮在行展开面板的操作区，文案随语言变化
+    （Renew / Renouveler / Erneuern / Renovar / Rinnova / Продлить），
+    并且只有到了可续期时间才渲染出来 —— 找不到即表示还没到续期时间。
+    """
+    try:
+        candidates = root.find_elements(By.CSS_SELECTOR, 'button, a')
+    except Exception:
+        return []
+
     buttons = []
-    for selector in selectors:
+    for button in candidates:
         try:
-            buttons.extend(find_elements(root, selector))
+            label = ' '.join(filter(None, [
+                element_text(button),
+                (button.get_attribute('aria-label') or ''),
+                (button.get_attribute('title') or ''),
+            ]))
         except Exception:
             continue
+        if RENEW_LABEL_PATTERN.search(label):
+            buttons.append(button)
 
-    def is_renew_like(button):
-        try:
-            if 'projects-renew-btn' in (button.get_attribute('class') or ''):
-                return True
-        except Exception:
-            pass
-        label = ' '.join(filter(None, [
-            element_text(button),
-            (button.get_attribute('aria-label') or ''),
-            (button.get_attribute('title') or ''),
-        ]))
-        return bool(re.search(r'renew|reactivate|续期|延长|prolong', label, re.I))
+    return unique_elements(buttons)
 
-    return unique_elements([b for b in buttons if is_renew_like(b)])
+def find_project_rows(sb):
+    """定位项目/服务行。
 
-def find_card_container_from_child(sb, child):
-    return sb.driver.execute_script(
+    2026-09 表格版：每行是 main 下的 <article data-service-id="...">。
+    行内 class 带构建哈希（ProjectsPage-module_xxx）不稳定，只认 data-service-id。
+    """
+    return sb.driver.find_elements(By.CSS_SELECTOR, 'main article[data-service-id]')
+
+def find_row_by_service_id(sb, service_id):
+    rows = sb.driver.find_elements(
+        By.CSS_SELECTOR, f'main article[data-service-id="{service_id}"]'
+    )
+    return rows[0] if rows else None
+
+def get_service_id(row):
+    try:
+        return row.get_attribute('data-service-id') or ''
+    except Exception:
+        return ''
+
+def expand_service_rows(sb):
+    """展开所有服务行 —— 过期倒计时和续期按钮都在折叠面板里。"""
+    sb.driver.execute_script(
         '''
-        const start = arguments[0];
-        let node = start;
-        for (let i = 0; node && i < 10; i += 1, node = node.parentElement) {
-          const text = (node.innerText || '').trim();
-          const cls = (node.className || '').toString().toLowerCase();
-          const looksLikeProject = /renew|reactivate|suspended|expiry|expire|expires|valid|续期|重新激活|恢复|暂停|过期|到期/i.test(text);
-          const looksLikeCard = /card|project|service|server|item|row/.test(cls);
-          if (node !== start && text.length > 20 && (looksLikeProject || looksLikeCard)) {
-            return node;
-          }
-        }
-        return start.parentElement || start;
-        ''',
-        child,
+        document.querySelectorAll('main article[data-service-id] button[aria-expanded]')
+          .forEach(btn => {
+            if (btn.getAttribute('aria-expanded') === 'false') btn.click();
+          });
+        '''
     )
-
-def find_project_cards(sb):
-    # 2026-09 改版：卡片根元素是 main 下的 <article>（ProjectsPage-module_* hash class，
-    # class 名不稳定，不能依赖）。过期信息在 Details 展开的 [id^="service-details"] 里。
-    candidate_selectors = [
-        'main article',
-        'article',
-        '.client-card',
-        '.client-card[class*="projects-card-"]',
-        '.projects-card',
-        '[class*="service"][class*="card"]',
-        '[class*="server"][class*="card"]',
-    ]
-    cards = []
-    for selector in candidate_selectors:
-        try:
-            for card in sb.driver.find_elements(By.CSS_SELECTOR, selector):
-                # 命中校验：卡片内要有项目标题或过期/续期相关文本，
-                # 避免把整页容器、通知块等误判为卡片
-                text = element_text(card)
-                if not text or len(text) > 800:
-                    continue
-                has_title = bool(card.find_elements(By.CSS_SELECTOR, 'h3'))
-                has_expiry_kw = any(keyword in text.lower() for keyword in ['renew', 'reactivate', 'suspended', 'expiry', 'expire', 'valid', '续期', '重新激活', '恢复', '暂停', '过期', '到期'])
-                if has_title or has_expiry_kw:
-                    cards.append(card)
-        except Exception:
-            continue
-
-    if cards:
-        return dedupe_project_cards(cards)
-
-    for button in find_renew_buttons(sb.driver):
-        try:
-            cards.append(find_card_container_from_child(sb, button))
-        except Exception:
-            continue
-
-    if cards:
-        return dedupe_project_cards(cards)
-
-    expiry_xpath = (
-        '//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "expiry") '
-        'or contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "expire") '
-        'or contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "valid") '
-        'or contains(normalize-space(.), "过期") or contains(normalize-space(.), "到期")]'
-    )
-    for elem in sb.driver.find_elements(By.XPATH, expiry_xpath):
-        try:
-            cards.append(find_card_container_from_child(sb, elem))
-        except Exception:
-            continue
-
-    return dedupe_project_cards(cards)
 
 def extract_date_like(text):
     if not text:
@@ -361,7 +271,13 @@ def extract_duration_like(text):
 
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     for idx, line in enumerate(lines):
-        if re.search(r'expires\s+in|剩余|还有', line, re.I) and idx + 1 < len(lines):
+        # "Expires in" 标签随语言变化：Expire dans / Läuft ab in / Expira en / ...
+        if re.search(
+            r'expires\s+in|expire\s+dans|l[äa]uft\s+ab\s+in|expira\s+en|истекает\s+через|'
+            r'scade\s+tra|expira\s+em|剩余|还有',
+            line,
+            re.I,
+        ) and idx + 1 < len(lines):
             return f"{line} {lines[idx + 1]}"
 
     match = re.search(
@@ -378,135 +294,90 @@ def extract_duration_like(text):
 
     return ''
 
-def get_project_name(card, idx):
-    # 新版页面：卡片标题是 card 内的 <h3>（如 "appa"）
-    selectors = [
-        'h3',
-        '.projects-card-title',
-        'h1',
-        'h2',
-        'h4',
-        '[class*="title"]',
-        '[class*="name"]',
-    ]
-    for selector in selectors:
-        try:
-            for elem in card.find_elements(By.CSS_SELECTOR, selector):
-                text = element_text(elem)
-                if text and len(text) <= 80 and 'renew' not in text.lower() and 'expiry' not in text.lower() and not extract_duration_like(text):
-                    return text
-        except Exception:
-            continue
+def row_text_lines(row):
+    """服务行的文本片段，按 DOM 顺序取叶子元素的文本。
 
-    for line in element_text(card).splitlines():
-        line = line.strip()
-        if line and len(line) <= 80 and not extract_duration_like(line) and not re.search(r'renew|reactivate|suspended|expiry|expire|valid|续期|重新激活|恢复|暂停|过期|到期', line, re.I):
-            return line
+    不用 Selenium 的 element.text：它按渲染后的换行切分，站点一改布局就会
+    把相邻字段粘成一行（service id 会和日期粘出 "4410/04/2026"）。叶子文本
+    与 CSS 无关，天然一段一个字段。
+    """
+    try:
+        return row.parent.execute_script(
+            '''
+            return Array.from(arguments[0].querySelectorAll('*'))
+              .filter(el => !el.children.length && !/^(script|style)$/i.test(el.tagName))
+              .map(el => (el.textContent || '').trim())
+              .filter(Boolean);
+            ''',
+            row,
+        ) or []
+    except Exception:
+        return []
+
+def get_project_name(row, idx):
+    # 2026-09 表格版：服务行第一行是套餐/机型名（如 "bot-free"），
+    # 展开面板里另有 "Custom name: appa"。取第一行有效文本作为名称。
+    for line in row_text_lines(row):
+        if len(line) > 80:
+            continue
+        if extract_date_like(line) or extract_duration_like(line):
+            continue
+        if NOISE_LINE_PATTERN.search(line):
+            continue
+        return line
     return f"项目 #{idx}"
 
-def get_project_expiry(card):
-    # 新版页面：过期信息（"Expires in 3j 23h"）在 Details 展开的
-    # [id^="service-details"] 区块里；未到续期时间时只有该提示行。
-    selectors = [
-        '[id^="service-details"]',
-        '.projects-expiry-value',
-        '[class*="expiry"]',
-        '[class*="expire"]',
-        '[class*="Expires"]',
-        './/*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "expiry")]',
-        './/*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "expire")]',
-        './/*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "valid")]',
-        './/*[contains(normalize-space(.), "过期") or contains(normalize-space(.), "到期")]',
-    ]
-    for selector in selectors:
-        try:
-            for elem in find_elements(card, selector):
-                text = element_text(elem)
-                date_text = extract_date_like(text)
-                if date_text:
-                    return date_text
-                duration_text = extract_duration_like(text)
-                if duration_text:
-                    return duration_text
-                if text and len(text) <= 120:
-                    return text
-        except Exception:
+def get_project_expiry(row):
+    # 2026-09 表格版：折叠行的 EXPIRY 列是绝对日期（如 10/04/2026），
+    # 展开面板里是倒计时（"Expires in 4j 6h"）。优先日期，其次倒计时。
+    lines = row_text_lines(row)
+    for line in lines:
+        date_text = extract_date_like(line)
+        if date_text:
+            return date_text
+    for line in lines:
+        duration_text = extract_duration_like(line)
+        if duration_text:
+            return duration_text
+    return '未知'
+
+def wait_for_renew_result(sb, service_id, old_expiry, known_lines=(), timeout=60):
+    """等待续期结果。
+
+    站点提示语随界面语言变化，所以不匹配固定文案，改用与语言无关的判据：
+    续期成功后服务行的 Renew 按钮会消失、过期时间会前移。
+    行内新出现的文本（Renewing... / 成功或失败提示）作为 result_note 带出去。
+    """
+    known = set(known_lines)
+    appeared = []
+    stable_hits = 0
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        row = find_row_by_service_id(sb, service_id)
+        if row is None:
+            sb.sleep(1)
             continue
 
-    card_text = element_text(card)
-    return extract_date_like(card_text) or extract_duration_like(card_text) or '未知'
+        for line in row_text_lines(row):
+            if line not in known and line not in appeared:
+                appeared.append(line)
 
-def get_renewal_available_note(card):
-    text = element_text(card)
-    patterns = [
-        r'Renewal\s+will\s+be\s+available[^\n]*',
-        r'La\s+prolongation\s+sera\s+possible[^\n]*',
-        r'可续期[^\n]*',
-        r'续期[^\n]*前[^\n]*',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return match.group(0).strip()
-    return ''
-
-def get_card_by_index(sb, idx):
-    cards = find_project_cards(sb)
-    if idx <= len(cards):
-        return cards[idx - 1]
-    return None
-
-def wait_for_renew_result(sb, idx, timeout=30):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        try:
-            success_modals = sb.driver.find_elements(
-                By.XPATH,
-                '//div[contains(@class, "modal") and contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "successfully")]',
-            )
-            if any(modal.is_displayed() for modal in success_modals):
-                card = get_card_by_index(sb, idx)
-                return True, get_project_expiry(card) if card else '未知', 'success modal'
-
-            card = get_card_by_index(sb, idx)
-            if card:
-                # 新版页面：续期成功后 Details 区块的 "Renewal will be available"
-                # 提示会消失（或被新过期时间取代），同时卡片内不再有 renew 按钮
-                sb.driver.execute_script('''
-                    document.querySelectorAll('main article button[aria-controls^="service-details"]')
-                      .forEach(btn => { if (btn.getAttribute('aria-expanded') === 'false') btn.click(); });
-                ''')
-                renewal_note = get_renewal_available_note(card)
-                renew_buttons = find_renew_buttons(card)
-                if renewal_note and not renew_buttons:
-                    return True, get_project_expiry(card), renewal_note
-        except Exception as e:
-            print(f"检查续期结果时暂时失败: {e}")
+        if not find_renew_buttons(row):
+            # 连续两次都看不到 Renew 按钮才判定，避开 React 重渲染的中间态
+            stable_hits += 1
+            if stable_hits >= 2:
+                new_expiry = get_project_expiry(row)
+                note = ' / '.join(appeared) or 'Renew 按钮已消失'
+                return True, new_expiry, note
+        else:
+            stable_hits = 0
 
         sb.sleep(1)
 
-    card = get_card_by_index(sb, idx)
-    note = get_renewal_available_note(card) if card else ''
-    expiry = get_project_expiry(card) if card else '未知'
-    return False, expiry, note
-
-def get_renew_note(card):
-    selectors = [
-        '[id^="service-details"]',
-        '.projects-renew-note',
-        '[class*="renew-note"]',
-        '[class*="note"]',
-        '[class*="tip"]',
-    ]
-    for selector in selectors:
-        try:
-            for elem in card.find_elements(By.CSS_SELECTOR, selector):
-                text = element_text(elem)
-                if text:
-                    return text
-        except Exception:
-            continue
-    return '未到续期时间'
+    row = find_row_by_service_id(sb, service_id)
+    expiry = get_project_expiry(row) if row else '未知'
+    return False, expiry, ' / '.join(appeared)
 
 def get_action_button_label(button):
     text = element_text(button)
@@ -527,22 +398,107 @@ def log_projects_page_diagnostics(sb):
     print(f"项目页诊断标题: {title}")
     print(f"项目页可见文本摘要: {body_text[:1200]}")
 
-def has_renew_antibot_modal(sb):
-    selectors = [
-        '//div[contains(., "Anti-bot confirmation")]',
-        '//div[contains(., "Confirm you are human")]',
-        '//div[contains(., "I am not a robot")]',
-    ]
-    for selector in selectors:
+def handle_renew_antibot(sb, project_name, timeout=10):
+    """Renew 之后如果弹出 Anti-bot confirmation，就完成弹窗内的 cap-widget 验证。
+
+    2026-09 版弹窗固定带 aria-labelledby="renew-captcha-title"，
+    用它定位与界面语言无关（弹窗标题会随语言变成 "Confirmation anti-robot" 等）。
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            if any(elem.is_displayed() for elem in sb.driver.find_elements(By.XPATH, selector)):
-                return True
+            dialogs = sb.driver.find_elements(By.CSS_SELECTOR, RENEW_CAPTCHA_DIALOG)
         except Exception:
-            continue
+            dialogs = []
+        if any(dialog.is_displayed() for dialog in dialogs):
+            print(f"[{project_name}] 检测到续期人机验证窗口")
+            return click_captcha_checkbox(sb, '续期人机验证', timeout=45)
+        sb.sleep(0.5)
+
+    print(f"[{project_name}] 未检测到续期人机验证窗口，继续等待续期结果")
     return False
 
-def click_captcha_checkbox(sb, label='验证码', timeout=10):
-    """点击 ACLClouds 页面上的人机验证复选框，并处理图形验证码挑战。"""
+def read_cap_state(sb):
+    """读取 <cap-widget> 的状态；组件未渲染时返回 None。
+
+    2026-09 改版后站点的人机验证换成自托管 Cap（proof-of-work）组件
+    <cap-widget>，内部结构在 shadow DOM 里，Selenium 的 CSS/XPath 查询
+    无法穿透，只能走 JS。
+    state: '' 待点击 / 'verifying' 计算中 / 'done' 已完成 / 'error' 失败
+    token: 隐藏域 cap-token 的值，非空即代表验证通过
+    """
+    return sb.driver.execute_script(
+        '''
+        const widgets = Array.from(document.querySelectorAll('cap-widget'));
+        const widget = widgets.find(w => w.offsetWidth || w.offsetHeight) || widgets[0];
+        if (!widget) return null;
+        const root = widget.shadowRoot;
+        const box = root ? root.querySelector('.captcha') : null;
+        const tokenInput = widget.querySelector('input[name="cap-token"]');
+        return {
+          state: box ? (box.getAttribute('data-state') || '') : '',
+          token: tokenInput ? (tokenInput.value || '') : '',
+        };
+        '''
+    )
+
+def trigger_cap_widget(sb):
+    """派发一次点击到 <cap-widget> 的复选框，返回是否成功触发。"""
+    return bool(sb.driver.execute_script(
+        '''
+        const widgets = Array.from(document.querySelectorAll('cap-widget'));
+        const widget = widgets.find(w => w.offsetWidth || w.offsetHeight) || widgets[0];
+        if (!widget || !widget.shadowRoot) return false;
+        const target = widget.shadowRoot.querySelector('.captcha-trigger')
+                    || widget.shadowRoot.querySelector('.captcha');
+        if (!target) return false;
+        target.click();
+        return true;
+        '''
+    ))
+
+def click_captcha_checkbox(sb, label='验证码', timeout=30):
+    """完成 ACLClouds 页面的人机验证。
+
+    主路径是 <cap-widget>：先在 shadow DOM 里点一次复选框，再轮询
+    cap-token 是否生成（PoW 计算 + 请求 cap 服务需要数秒）。
+    页面确实没有 cap-widget 时，才回退到旧版复选框实现。
+    """
+    # 等 cap-widget 渲染出来，再决定走哪条路径
+    deadline = time.time() + min(timeout, 15)
+    while time.time() < deadline and read_cap_state(sb) is None:
+        sb.sleep(0.3)
+
+    if read_cap_state(sb) is None:
+        if sb.is_element_present('div.auth-captcha-inner[role="checkbox"]'):
+            return click_legacy_captcha_checkbox(sb, label, timeout)
+        print(f"{label} 页面上没有找到人机验证组件（cap-widget）")
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = read_cap_state(sb) or {}
+        if state.get('token'):
+            print(f"{label} 验证通过")
+            return True
+        if state.get('state') == 'verifying':
+            # 已在计算 PoW，别重复点击，等结果
+            sb.sleep(0.5)
+            continue
+        if not trigger_cap_widget(sb):
+            print(f"{label} 未能触发 cap-widget 点击")
+            return False
+        print(f"{label} 已点击人机验证，等待校验结果...")
+        sb.sleep(1)
+
+    print(f"{label} 等待人机验证结果超时（{timeout} 秒）")
+    return False
+
+def click_legacy_captcha_checkbox(sb, label='验证码', timeout=10):
+    """旧版人机验证实现：点击 [role="checkbox"] 并处理图形点选挑战。
+
+    站点 2026-09 改版后已不再使用，仅在页面没有 cap-widget 时回退。
+    """
     selectors = [
         'div.auth-captcha-inner[role="checkbox"]',
         '//div[contains(., "Anti-bot confirmation")]//*[@role="checkbox"]',
@@ -804,25 +760,6 @@ def build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note)
     ])
     return "\n".join(lines)
 
-def handle_renew_antibot(sb, project_name):
-    """Renew 后如果弹出 Anti-bot confirmation，则点击确认。"""
-    modal_selectors = [
-        '//div[contains(., "Anti-bot confirmation")]',
-        '//div[contains(., "Confirm you are human")]',
-        '//div[contains(., "I am not a robot")]',
-    ]
-
-    for selector in modal_selectors:
-        try:
-            sb.wait_for_element_visible(selector, timeout=5)
-            print(f"[{project_name}] 检测到续期人机验证窗口")
-            return click_captcha_checkbox(sb, '续期人机验证', timeout=5)
-        except Exception:
-            continue
-
-    print(f"[{project_name}] 未检测到续期人机验证窗口，继续等待续期结果")
-    return False
-
 def js_set_input_value(sb, selector, value):
     sb.execute_script(
         '''
@@ -993,47 +930,54 @@ def main():
         else:
             print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
 
-        # 2. 定位卡片（新版页面过期信息在 Details 折叠区里，先全部展开）
+        # 2. 定位服务行（过期倒计时与 Renew 按钮都在行的折叠面板里，先展开）
         try:
-            sb.driver.execute_script('''
-                document.querySelectorAll('main article button[aria-controls^="service-details"]')
-                  .forEach(btn => { if (btn.getAttribute('aria-expanded') === 'false') btn.click(); });
-            ''')
-            time.sleep(1)
+            expand_service_rows(sb)
+            time.sleep(1.5)
         except Exception as e:
-            print(f"展开 Details 失败（忽略）: {e}")
+            print(f"展开服务行失败（忽略）: {e}")
 
-        cards = find_project_cards(sb)
+        rows = find_project_rows(sb)
 
-        if not cards:
+        if not rows:
             print("❌ 未找到项目卡片。")
             log_projects_page_diagnostics(sb)
             send_telegram("⚠️ 未找到项目卡片，请检查页面结构。")
             return
 
-        print(f"找到 {len(cards)} 个项目卡片。")
-        for idx, card in enumerate(cards, 1):
+        service_ids = [sid for sid in (get_service_id(row) for row in rows) if sid]
+        print(f"找到 {len(service_ids)} 个项目卡片。")
+        for idx, service_id in enumerate(service_ids, 1):
             try:
-                project_name = get_project_name(card, idx)
-                old_expiry = get_project_expiry(card)
+                # 每次重新定位：续期成功后 React 会重取列表，旧句柄会失效
+                expand_service_rows(sb)
+                row = find_row_by_service_id(sb, service_id)
+                if row is None:
+                    print(f"第 {idx} 个服务行已消失，跳过")
+                    continue
+
+                project_name = get_project_name(row, idx)
+                old_expiry = get_project_expiry(row)
+                before_lines = row_text_lines(row)
                 print(f"[{project_name}] 当前过期: {old_expiry}")
 
-                renew_btn = find_renew_buttons(card)
+                renew_btn = find_renew_buttons(row)
 
                 if renew_btn:
                     action_label = get_action_button_label(renew_btn[0])
                     safe_click_element(sb, renew_btn[0], f"[{project_name}] {action_label}按钮")
                     print(f"[{project_name}] 点击 {action_label}...")
                     handle_renew_antibot(sb, project_name)
-                    success, new_expiry, result_note = wait_for_renew_result(sb, idx, timeout=30)
+                    success, new_expiry, result_note = wait_for_renew_result(
+                        sb, service_id, old_expiry, before_lines, timeout=60)
                     if success:
                         print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
                         send_telegram(build_success_message(project_name, old_expiry, new_expiry))
                     else:
                         send_telegram(build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note))
                 else:
-                    note = get_renew_note(card)
-                    print(f"无 Renew 按钮，提示: {note}")
+                    # 2026-09 版页面：只有到了可续期时间才渲染 Renew 按钮
+                    print(f"[{project_name}] 页面上没有 Renew 按钮，判定为未到续期时间")
                     send_telegram(build_not_yet_due_message(project_name, old_expiry))
             except Exception as e:
                 print(f"处理卡片 {idx} 出错: {e}")
