@@ -195,11 +195,15 @@ NOISE_LINE_PATTERN = re.compile(
 )
 
 def find_renew_buttons(root):
-    """在服务行里找「续期」按钮。
+    """找「续期」按钮。
 
-    2026-09 表格版：续期按钮在行展开面板的操作区，文案随语言变化
-    （Renew / Renouveler / Erneuern / Renovar / Rinnova / Продлить），
-    并且只有到了可续期时间才渲染出来 —— 找不到即表示还没到续期时间。
+    续期入口只在服务详情页 /server/<id>。列表页虽然也渲染 Renew 按钮，但站点
+    用 CSS `article[data-service-id] a[href^="/server/"] + button { display:none
+    !important }` 把它藏了 —— 那个按钮既点不到，Selenium 的 .text 也读成空串。
+
+    按钮文案随语言变化（Renew / Renouveler / Erneuern / Renovar / Rinnova /
+    Продлить），且是内联样式、没有 class 可依赖，只能按文本找；文本用
+    textContent 取，不依赖可见性。
     """
     try:
         candidates = root.find_elements(By.CSS_SELECTOR, 'button, a')
@@ -209,8 +213,10 @@ def find_renew_buttons(root):
     buttons = []
     for button in candidates:
         try:
+            if not button.is_displayed():
+                continue
             label = ' '.join(filter(None, [
-                element_text(button),
+                (button.get_attribute('textContent') or '').strip(),
                 (button.get_attribute('aria-label') or ''),
                 (button.get_attribute('title') or ''),
             ]))
@@ -241,8 +247,22 @@ def get_service_id(row):
     except Exception:
         return ''
 
+def get_detail_url(row):
+    """服务行的详情页地址（展开面板里的 "View service details" 链接）。
+
+    面板路径由服务类型决定：proxmox 走 /dashboard/vps/<id>，其余走 /server/<id>。
+    """
+    try:
+        for link in row.find_elements(By.CSS_SELECTOR, 'a[href]'):
+            href = link.get_attribute('href') or ''
+            if '/server/' in href or '/dashboard/vps/' in href:
+                return href
+    except Exception:
+        pass
+    return ''
+
 def expand_service_rows(sb):
-    """展开所有服务行 —— 过期倒计时和续期按钮都在折叠面板里。"""
+    """展开所有服务行 —— 过期时间与详情页链接都在折叠面板里。"""
     sb.driver.execute_script(
         '''
         document.querySelectorAll('main article[data-service-id] button[aria-expanded]')
@@ -251,6 +271,36 @@ def expand_service_rows(sb):
           });
         '''
     )
+
+def wait_for_detail_page(sb, timeout=25):
+    """等服务详情页主内容渲染完（它是异步加载的，首次约 5 秒）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            text_len = sb.driver.execute_script(
+                "const m = document.querySelector('main');"
+                "return m ? (m.innerText || '').length : 0;"
+            )
+        except Exception:
+            text_len = 0
+        if text_len and text_len > 200:
+            return True
+        sb.sleep(0.5)
+    return False
+
+def read_project_expiry(sb, service_id):
+    """回服务列表页读该服务当前的过期日期（续期成功后会前移）。"""
+    try:
+        sb.open(PROJECTS_URL)
+        sb.wait_for_ready_state_complete()
+        time.sleep(2)
+        expand_service_rows(sb)
+        time.sleep(1.5)
+        row = find_row_by_service_id(sb, service_id)
+        return get_project_expiry(row) if row else ''
+    except Exception as e:
+        print(f"回列表页读取新过期时间失败（忽略）: {e}")
+        return ''
 
 def extract_date_like(text):
     if not text:
@@ -341,12 +391,34 @@ def get_project_expiry(row):
             return duration_text
     return '未知'
 
-def wait_for_renew_result(sb, service_id, old_expiry, known_lines=(), timeout=60):
+def page_text_lines(sb):
+    try:
+        return sb.driver.execute_script(
+            "const m = document.querySelector('main');"
+            "return m ? (m.innerText || '').split('\\n').map(s => s.trim()).filter(Boolean) : [];"
+        ) or []
+    except Exception:
+        return []
+
+def find_main(sb):
+    """页面主体容器；拿不到时退回 driver（等价于全文档搜索）。
+
+    续期按钮在 <main> 里，顶栏/侧栏不含同名元素——比如列表页导航的
+    "My renewals" 也带 renew 字样，收窄范围避免误命中。
+    """
+    try:
+        elements = sb.driver.find_elements(By.CSS_SELECTOR, 'main')
+    except Exception:
+        return sb.driver
+    return elements[0] if elements else sb.driver
+
+def wait_for_renew_result(sb, known_lines=(), timeout=60):
     """等待续期结果。
 
-    站点提示语随界面语言变化，所以不匹配固定文案，改用与语言无关的判据：
-    续期成功后服务行的 Renew 按钮会消失、过期时间会前移。
-    行内新出现的文本（Renewing... / 成功或失败提示）作为 result_note 带出去。
+    详情页续期成功后会 reload（见 7994.js 的续期处理），因此以「Renew 按钮
+    消失」作为成功判据，与界面语言无关。reload / 导航期间 driver 会短暂不可
+    用，需要容错；连续两次确认按钮不存在才判定成功。点击后页面上新出现的
+    提示文本作为 result_note 带出去。
     """
     known = set(known_lines)
     appeared = []
@@ -354,30 +426,29 @@ def wait_for_renew_result(sb, service_id, old_expiry, known_lines=(), timeout=60
     start_time = time.time()
 
     while time.time() - start_time < timeout:
-        row = find_row_by_service_id(sb, service_id)
-        if row is None:
+        try:
+            buttons = find_renew_buttons(find_main(sb))
+            url = sb.get_current_url()
+        except Exception:
+            # reload 过程中 driver 短暂不可用，等下一轮
             sb.sleep(1)
             continue
 
-        for line in row_text_lines(row):
+        for line in page_text_lines(sb):
             if line not in known and line not in appeared:
                 appeared.append(line)
 
-        if not find_renew_buttons(row):
-            # 连续两次都看不到 Renew 按钮才判定，避开 React 重渲染的中间态
+        on_detail_page = '/server/' in url or '/dashboard/vps/' in url
+        if on_detail_page and not buttons:
             stable_hits += 1
             if stable_hits >= 2:
-                new_expiry = get_project_expiry(row)
-                note = ' / '.join(appeared) or 'Renew 按钮已消失'
-                return True, new_expiry, note
+                return True, ' / '.join(appeared)
         else:
             stable_hits = 0
 
         sb.sleep(1)
 
-    row = find_row_by_service_id(sb, service_id)
-    expiry = get_project_expiry(row) if row else '未知'
-    return False, expiry, ' / '.join(appeared)
+    return False, ' / '.join(appeared)
 
 def get_action_button_label(button):
     text = element_text(button)
@@ -476,9 +547,14 @@ def click_captcha_checkbox(sb, label='验证码', timeout=30):
         return False
 
     deadline = time.time() + timeout
+    clicked = False
     while time.time() < deadline:
-        state = read_cap_state(sb) or {}
-        if state.get('token'):
+        state = read_cap_state(sb)
+        if state is None:
+            # 组件消失：续期弹窗在验证通过后会立刻卸载
+            print(f"{label} 验证通过" if clicked else f"{label} 人机验证组件已消失")
+            return clicked
+        if state.get('token') or state.get('state') == 'done':
             print(f"{label} 验证通过")
             return True
         if state.get('state') == 'verifying':
@@ -486,8 +562,13 @@ def click_captcha_checkbox(sb, label='验证码', timeout=30):
             sb.sleep(0.5)
             continue
         if not trigger_cap_widget(sb):
+            # 点击的瞬间组件被移除（通常意味着已经验证通过）
+            if read_cap_state(sb) is None:
+                print(f"{label} 验证通过")
+                return True
             print(f"{label} 未能触发 cap-widget 点击")
             return False
+        clicked = True
         print(f"{label} 已点击人机验证，等待校验结果...")
         sb.sleep(1)
 
@@ -930,7 +1011,7 @@ def main():
         else:
             print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
 
-        # 2. 定位服务行（过期倒计时与 Renew 按钮都在行的折叠面板里，先展开）
+        # 2. 在服务列表页收集服务清单（详情页链接在行的折叠面板里，先展开）
         try:
             expand_service_rows(sb)
             time.sleep(1.5)
@@ -945,39 +1026,56 @@ def main():
             send_telegram("⚠️ 未找到项目卡片，请检查页面结构。")
             return
 
-        service_ids = [sid for sid in (get_service_id(row) for row in rows) if sid]
-        print(f"找到 {len(service_ids)} 个项目卡片。")
-        for idx, service_id in enumerate(service_ids, 1):
+        projects = []
+        for idx, row in enumerate(rows, 1):
+            service_id = get_service_id(row)
+            if not service_id:
+                continue
+            projects.append({
+                'service_id': service_id,
+                'name': get_project_name(row, idx),
+                'expiry': get_project_expiry(row),
+                'detail_url': get_detail_url(row) or f'{BASE_URL}/server/{service_id}',
+            })
+
+        print(f"找到 {len(projects)} 个项目卡片。")
+        for idx, project in enumerate(projects, 1):
+            service_id = project['service_id']
+            project_name = project['name']
+            old_expiry = project['expiry']
             try:
-                # 每次重新定位：续期成功后 React 会重取列表，旧句柄会失效
-                expand_service_rows(sb)
-                row = find_row_by_service_id(sb, service_id)
-                if row is None:
-                    print(f"第 {idx} 个服务行已消失，跳过")
+                print(f"[{project_name}] 当前过期: {old_expiry}，详情页: {project['detail_url']}")
+
+                # 续期入口只在服务详情页：列表页也渲染了 Renew 按钮，但站点用
+                # CSS `article[data-service-id] a[href^="/server/"] + button
+                # { display: none !important }` 把它藏了，点不到。
+                sb.open(project['detail_url'])
+                sb.wait_for_ready_state_complete()
+                if not wait_for_detail_page(sb):
+                    print(f"[{project_name}] 详情页未渲染完成，跳过")
+                    send_telegram(build_unconfirmed_message(
+                        project_name, old_expiry, old_expiry, '详情页未渲染完成'))
                     continue
 
-                project_name = get_project_name(row, idx)
-                old_expiry = get_project_expiry(row)
-                before_lines = row_text_lines(row)
-                print(f"[{project_name}] 当前过期: {old_expiry}")
-
-                renew_btn = find_renew_buttons(row)
+                before_lines = page_text_lines(sb)
+                renew_btn = find_renew_buttons(find_main(sb))
 
                 if renew_btn:
                     action_label = get_action_button_label(renew_btn[0])
                     safe_click_element(sb, renew_btn[0], f"[{project_name}] {action_label}按钮")
                     print(f"[{project_name}] 点击 {action_label}...")
                     handle_renew_antibot(sb, project_name)
-                    success, new_expiry, result_note = wait_for_renew_result(
-                        sb, service_id, old_expiry, before_lines, timeout=60)
+                    success, result_note = wait_for_renew_result(sb, before_lines, timeout=60)
                     if success:
-                        print(f"续期成功！状态: {result_note}，新过期: {new_expiry}")
+                        new_expiry = read_project_expiry(sb, service_id) or old_expiry
+                        print(f"续期成功！状态: {result_note or 'Renew 按钮已消失'}，新过期: {new_expiry}")
                         send_telegram(build_success_message(project_name, old_expiry, new_expiry))
                     else:
-                        send_telegram(build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note))
+                        send_telegram(build_unconfirmed_message(
+                            project_name, old_expiry, old_expiry, result_note))
                 else:
-                    # 2026-09 版页面：只有到了可续期时间才渲染 Renew 按钮
-                    print(f"[{project_name}] 页面上没有 Renew 按钮，判定为未到续期时间")
+                    # 详情页只有到了可续期时间才渲染 Renew 按钮
+                    print(f"[{project_name}] 详情页没有 Renew 按钮，判定为未到续期时间")
                     send_telegram(build_not_yet_due_message(project_name, old_expiry))
             except Exception as e:
                 print(f"处理卡片 {idx} 出错: {e}")
