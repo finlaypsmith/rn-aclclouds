@@ -6,7 +6,7 @@
 站点大致每隔几个月就会调整 DOM，此前已经适配过三轮（域名迁移、项目页表格化、
 人机验证换成 Cap）。**页面结构一变，这里的结论全部作废，请按第六节重新核对。**
 
-最后核对日期：2026-10-09
+最后核对日期：2026-11-06
 
 ---
 
@@ -17,6 +17,7 @@
   → 未登录则用账号密码登录（含人机验证）
   → 收集服务清单（service id / 名称 / 过期日期 / 详情页链接）
   → 逐个进 /server/<id> 详情页
+      → 状态 offline：点 Start 拉起服务
       → 有 Renew 按钮：点击 → 完成人机验证 → 等待结果
       → 没有 Renew 按钮：判定为未到续期时间
   → 每个服务发一条 Telegram 通知
@@ -79,31 +80,64 @@ PoW 计算 + 请求 cap 服务大约 5 秒。
 
 ### 服务列表页 `/dashboard/projects`
 
-表格布局，每行：
+**2026-11 卡片版**，每行是 `<ul>` 下的 `<li data-service-id>`：
 
 ```html
-<article data-service-id="80eba126">
-  <button aria-expanded="false">      <!-- 行头，点击展开 -->
-    <span>bot-free</span>             <!-- 套餐/机型名 -->
-    <span>Discord bot</span>
-    <span>80eba126-ebf3-4a91-...</span><!-- 完整 UUID -->
-    <span>10/13/2026</span>           <!-- EXPIRY -->
-    <span>Automatic</span>            <!-- RENEWAL -->
-    <span>Active</span>               <!-- STATUS -->
-  </button>
-  <div>…展开面板：过期倒计时、操作按钮…</div>
-</article>
+<ul>
+  <li data-service-id="80eba126">
+    <div>
+      <h3>appa</h3>                     <!-- 服务名（自定义名） -->
+      <p>Free · Discord bot</p>         <!-- 套餐 · 类型 -->
+    </div>
+    <p>
+      <span>Active</span>                                  <!-- STATUS -->
+      <span><span>Expires on</span> <span>11/28/2026</span></span>  <!-- EXPIRY -->
+      <span>Free</span>
+    </p>
+    <div>
+      <a href="/server/468d90dd-6b54-…">Manage</a>          <!-- 详情页 -->
+      <button aria-expanded="false"
+              aria-controls="service-details-server-80eba126">…</button>
+    </div>
+    <div id="service-details-server-80eba126" hidden></div> <!-- 展开面板 -->
+  </li>
+</ul>
 ```
 
 - 行内 class 是 `ProjectsPage-module_xxx`（带构建哈希），**不稳定，不要依赖**。
   唯一可靠的锚点是 `data-service-id`。
-- 展开面板里有 `a[href^="/server/"]`（"View service details"）→ 详情页地址。
-  VPS 类型是 `/dashboard/vps/<id>`。
-- 展开面板里还有 "Expires in 4j 6h" 倒计时。
+- **⚠️ `data-service-id` 是短 id（`80eba126`），详情页链接里是完整 UUID
+  （`468d90dd-…`），两者不同，不能互相拼接。** 拿不到链接时宁可跳过，也别拼
+  `/server/<短 id>`（会 404）。
+- 详情页链接直接是行内的 "Manage"，不必展开面板；过期日期也在折叠行里。
+- 2026-09 的表格版用的是 `<article data-service-id>`。脚本两种都兼容：
+  `main article[data-service-id], main li[data-service-id]`。
 
 **⚠️ 列表页的 Renew 按钮是个陷阱**，详见第三节。
 
-### 服务详情页 `/server/<id>` —— 唯一的续期入口
+### 服务详情页 `/server/<id>` —— 续期入口与电源控制
+
+头部状态胶囊与电源按钮（2026-11 版）：
+
+```html
+<div class="srv-head-titleline">
+  <span role="status" data-server-status="offline">Offline</span>
+</div>
+<div>
+  <button class="srv-power-btn">Start</button>
+  <button class="srv-power-btn" disabled>Restart</button>
+  <button class="srv-power-btn" disabled>Stop</button>
+</div>
+```
+
+- **状态判据用 `data-server-status`**（`offline` / `starting` / `running` /
+  `stopping`），与界面语言无关，比读 "Offline" 文案可靠。
+- 服务离线时只有 Start 可点，Restart / Stop 都是 `disabled`。
+- Start 文案随语言变化（Start / Démarrer / Starten / Iniciar / Avvia /
+  Запустить / 启动），按**整词**匹配——"Restart" 里含 "start"，子串匹配会点错。
+- 点击后状态先变 `starting`，几秒内变 `running`（脚本轮询 20 秒）。
+
+续期提示条：
 
 ```html
 <div style="display:flex; …">                    <!-- 提示条，全内联样式、无 class -->
@@ -169,7 +203,11 @@ POST /api/client/servers/{id}/upgrade/renew
 
 按踩到的顺序，每条都是实际浪费过时间的。
 
-### 1. 列表页的 Renew 按钮存在，但被站点自己的 CSS 藏了
+### 1. 列表页的 Renew 按钮存在，但被站点自己的 CSS 藏了（2026-09 表格版）
+
+> 2026-11 卡片版的折叠行里只有 "Manage" 和 "更多" 菜单，没有可见的 Renew
+> 按钮；续期入口仍然只在详情页。下面这条只在回到 `<article>` 表格版时才需要
+> 重新确认。
 
 ```css
 article[data-service-id] a[href^="/server/"] + button,
@@ -238,10 +276,12 @@ Selenium 的 CSS/XPath 不穿透 shadow root。`element.shadow_root` 能用，
 
 | 目标 | 定位方式 |
 |---|---|
-| 服务行 | `main article[data-service-id]` |
-| 服务名 | 行的第一个叶子节点文本 |
-| 过期日期 | 行内第一个日期（EXPIRY 列） |
-| 详情页链接 | 行内 `a[href^="/server/"]` 或 `/dashboard/vps/` |
+| 服务行 | `main article[data-service-id], main li[data-service-id]` |
+| 服务名 | 行内第一个叶子节点文本（2026-11 版即 `<h3>`） |
+| 过期日期 | 行内第一个日期（`Expires on` 后面那个） |
+| 详情页链接 | 行内 `a[href^="/server/"]` 或 `/dashboard/vps/`（2026-11 版是 "Manage"） |
+| 服务状态 | `main [data-server-status]`，值 offline / starting / running / stopping |
+| Start 按钮 | `main button.srv-power-btn`，文本整词匹配多语言 Start |
 | 续期按钮 | `<main>` 内文本匹配多语言 Renew 的可见 `button`/`a` |
 | 人机验证组件 | `document.querySelectorAll('cap-widget')` 中可见的那个 |
 | 人机验证弹窗 | `div[role="dialog"][aria-labelledby="renew-captcha-title"]` |
@@ -262,6 +302,8 @@ Selenium 的 CSS/XPath 不穿透 shadow root。`element.shadow_root` 能用，
 - **隐藏按钮防线**：夹具里加上站点那条真实 CSS，隐藏的 Renew 必须不被选中
 - **范围防线**：`main` 外的 "My renewals" 必须不被命中
 - 详情页全链路：等渲染 → 定位 → 点击 → 人机验证 → 结果确认
+- 离线自动启动：`data-server-status` 判据、7 种语言的 Start 文案、
+  "Restart 不能被当成 Start"
 - 7 种语言的续期按钮文案
 
 夹具由浏览器抓取生成，见 `fixture_*.html`。
@@ -321,7 +363,8 @@ python3 .tmp/crawl_chunks.py     # 递归抓取所有 chunk 到 /tmp/acljs/<hash
 > 下载用 `requests` 而不是 `urllib` —— 这个站点的响应走 urllib 会稳定抛
 > `IncompleteRead`。
 
-本轮排查中各组件的落点（hash 会变，仅供参考）：
+本轮排查中各组件的落点（**这是 2026-09 版的映射，2026-11 改版后 chunk id
+和 hash 很可能都变了，务必重跑 `crawl_chunks.py` 再核对**）：
 
 | chunk | 内容 |
 |---|---|
@@ -353,6 +396,8 @@ for (const sheet of document.styleSheets)
 ## 七、已知限制
 
 - **列表页的续期按钮**：站点故意隐藏，脚本不去点它；只把它当作"没有按钮"的证据。
+- **自动启动只点一次**：只在状态为 `offline` 时点 Start，点完以「状态离开 offline」
+  为准，不保证服务能稳定跑住；若启动后崩溃，要等下一轮运行才会再次拉起。
 - **续期动作无法随时验证**：免费 bot 套餐 4 天一个周期，只有窗口开着时才测得到。
 - **续期失败的原因**：站点只在 toast 里提示，且文案随语言变化，
   脚本目前只回传"页面上新出现的文本"，不做解析。

@@ -98,6 +98,9 @@ LOGIN_PATH = '/auth/login'
 BASE_URL = 'https://aclclouds.com'
 PROJECTS_URL = f'{BASE_URL}/dashboard/projects'
 
+# 由 main() 填充；通知里带上，便于区分本机 / CI / 代理等不同运行环境
+EXIT_IP = ''
+
 def beijing_time_str():
     try:
         return datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')
@@ -197,9 +200,10 @@ NOISE_LINE_PATTERN = re.compile(
 def find_renew_buttons(root):
     """找「续期」按钮。
 
-    续期入口只在服务详情页 /server/<id>。列表页虽然也渲染 Renew 按钮，但站点
-    用 CSS `article[data-service-id] a[href^="/server/"] + button { display:none
-    !important }` 把它藏了 —— 那个按钮既点不到，Selenium 的 .text 也读成空串。
+    续期入口只在服务详情页。2026-09 表格版列表页还会渲染一个 Renew 按钮，
+    但站点用 CSS `article[data-service-id] a[href^="/server/"] + button
+    { display:none !important }` 把它藏了 —— 既点不到，Selenium 的 .text 也
+    读成空串。2026-11 卡片版列表行里没有 Renew 按钮。总之不要拿列表页当入口。
 
     按钮文案随语言变化（Renew / Renouveler / Erneuern / Renovar / Rinnova /
     Продлить），且是内联样式、没有 class 可依赖，只能按文本找；文本用
@@ -227,17 +231,18 @@ def find_renew_buttons(root):
 
     return unique_elements(buttons)
 
-def find_project_rows(sb):
-    """定位项目/服务行。
+# 服务行的标签随站点版本变化：2026-09 表格版是 <article>，2026-11 卡片版是
+# <ul> 下的 <li>。两者都带 data-service-id，class 名带构建哈希不可依赖。
+SERVICE_ROW_SELECTOR = 'main article[data-service-id], main li[data-service-id]'
 
-    2026-09 表格版：每行是 main 下的 <article data-service-id="...">。
-    行内 class 带构建哈希（ProjectsPage-module_xxx）不稳定，只认 data-service-id。
-    """
-    return sb.driver.find_elements(By.CSS_SELECTOR, 'main article[data-service-id]')
+def find_project_rows(sb):
+    """定位项目/服务行。"""
+    return sb.driver.find_elements(By.CSS_SELECTOR, SERVICE_ROW_SELECTOR)
 
 def find_row_by_service_id(sb, service_id):
     rows = sb.driver.find_elements(
-        By.CSS_SELECTOR, f'main article[data-service-id="{service_id}"]'
+        By.CSS_SELECTOR,
+        f'main article[data-service-id="{service_id}"], main li[data-service-id="{service_id}"]',
     )
     return rows[0] if rows else None
 
@@ -248,9 +253,11 @@ def get_service_id(row):
         return ''
 
 def get_detail_url(row):
-    """服务行的详情页地址（展开面板里的 "View service details" 链接）。
+    """服务行的详情页地址。
 
+    2026-09 表格版在展开面板里，2026-11 卡片版直接是行内的 "Manage" 链接。
     面板路径由服务类型决定：proxmox 走 /dashboard/vps/<id>，其余走 /server/<id>。
+    注意 data-service-id 是短 id，和链接里的完整 UUID 不同，不能互相拼接。
     """
     try:
         for link in row.find_elements(By.CSS_SELECTOR, 'a[href]'):
@@ -262,13 +269,15 @@ def get_detail_url(row):
     return ''
 
 def expand_service_rows(sb):
-    """展开所有服务行 —— 过期时间与详情页链接都在折叠面板里。"""
+    """展开所有服务行 —— 2026-09 表格版的过期时间与详情页链接都在折叠面板里。"""
     sb.driver.execute_script(
         '''
-        document.querySelectorAll('main article[data-service-id] button[aria-expanded]')
-          .forEach(btn => {
-            if (btn.getAttribute('aria-expanded') === 'false') btn.click();
-          });
+        document.querySelectorAll(
+          'main article[data-service-id] button[aria-expanded],'
+          + 'main li[data-service-id] button[aria-expanded]'
+        ).forEach(btn => {
+          if (btn.getAttribute('aria-expanded') === 'false') btn.click();
+        });
         '''
     )
 
@@ -287,6 +296,75 @@ def wait_for_detail_page(sb, timeout=25):
             return True
         sb.sleep(0.5)
     return False
+
+def read_server_status(sb):
+    """服务详情页的电源状态：offline / starting / running / stopping ...
+
+    2026-11 版把它渲染成 <span role="status" data-server-status="offline">，
+    属性值与界面语言无关，比读文案可靠。
+    """
+    try:
+        elements = sb.driver.find_elements(By.CSS_SELECTOR, 'main [data-server-status]')
+    except Exception:
+        return ''
+    for element in elements:
+        try:
+            value = (element.get_attribute('data-server-status') or '').strip().lower()
+        except Exception:
+            continue
+        if value:
+            return value
+    return ''
+
+# 电源按钮文案随语言变化。按整词匹配——"Restart" 里就含 "start"，
+# 用子串匹配会点错按钮。
+START_LABELS = {
+    'start', 'démarrer', 'demarrer', 'starten', 'iniciar', 'avvia',
+    'запустить', '启动', '開啟', '开启',
+}
+
+def find_start_button(sb):
+    """找可点击的 Start 按钮（离线的服务上只有它是 enabled）。"""
+    try:
+        candidates = sb.driver.find_elements(By.CSS_SELECTOR, 'main button.srv-power-btn')
+    except Exception:
+        return None
+    for button in candidates:
+        try:
+            if not button.is_displayed() or not button.is_enabled():
+                continue
+            labels = [
+                (button.get_attribute('textContent') or '').strip().casefold(),
+                (button.get_attribute('aria-label') or '').strip().casefold(),
+                (button.get_attribute('title') or '').strip().casefold(),
+            ]
+        except Exception:
+            continue
+        if any(label in START_LABELS for label in labels):
+            return button
+    return None
+
+def ensure_server_started(sb, project_name, timeout=20):
+    """服务离线时点一次 Start，返回给通知用的说明（没有动作时返回 ''）。"""
+    status = read_server_status(sb)
+    if status != 'offline':
+        return ''
+    button = find_start_button(sb)
+    if not button:
+        print(f"[{project_name}] 状态为 offline，但没有找到可用的 Start 按钮")
+        return "⚠️ 服务处于 offline，但页面上没有可用的 Start 按钮"
+    print(f"[{project_name}] 状态为 offline，点击 Start 启动")
+    safe_click_element(sb, button, f"[{project_name}] Start 按钮")
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        current = read_server_status(sb)
+        if current and current != 'offline':
+            print(f"[{project_name}] 启动请求已提交，当前状态: {current}")
+            return f"▶️ 已启动服务: offline → {current}"
+        sb.sleep(0.5)
+    print(f"[{project_name}] 已点击 Start，但状态仍为 offline")
+    return "⚠️ 已点击 Start，但服务状态仍为 offline"
 
 def read_project_expiry(sb, service_id):
     """回服务列表页读该服务当前的过期日期（续期成功后会前移）。"""
@@ -801,45 +879,67 @@ def mask_email(email):
         masked_local = f"{local[:2]}****{local[-2:]}"
     return f"{masked_local}@{domain}"
 
-def build_success_message(project_name, old_expiry, new_expiry):
-    masked_email = mask_email(EMAIL)
-    lines = [
-        "🇫🇷 Aclclouds 续期通知",
-        "",
-        "✅ 续期成功",
-        f"⏱️ 新过期时间: {new_expiry}",
-        f"👤 登录账户: {masked_email}",
-        f"⏱️ 运行时间: {beijing_time_str()}",
-    ]
-    return "\n".join(lines)
+def build_message(status, detail=(), project_name='', service_id='', detail_url='',
+                  power_note=''):
+    """统一的 Telegram 消息格式。
 
-def build_not_yet_due_message(project_name, expiry):
-    masked_email = mask_email(EMAIL)
+    头部的站点/账户/出口 IP/运行时间是为了让通知自己说明「谁、在哪、什么时候
+    发的」——同一套 bot 会推多个脚本的通知，只写一句状态无法分辨来源。
+    """
     lines = [
-        "🇫🇷 Aclclouds 续期通知",
-        "",
-        "⏳ 未到续期时间",
-        f"⏱️ 当前过期时间: {expiry}",
-        f"👤 登录账户: {masked_email}",
-        f"⏱️ 运行时间: {beijing_time_str()}",
+        "🔔 ACLClouds 自动续期",
+        f"👤 账户: {mask_email(EMAIL)}",
     ]
-    return "\n".join(lines)
-
-def build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note):
-    masked_email = mask_email(EMAIL)
-    lines = [
-        "🇫🇷 Aclclouds 续期通知",
-        "",
-        f"❌ 续期状态未确认: {project_name}",
-        f"👤 登录账户: {masked_email}",
-    ]
-    if old_expiry and old_expiry.lower() not in ['suspended', 'paused', '暂停']:
-        lines.append(f"旧过期: {old_expiry}")
+    if EXIT_IP:
+        lines.append(f"📡 出口 IP: {EXIT_IP}")
     lines.extend([
-        f"当前过期: {new_expiry}",
-        f"页面提示: {result_note or '未发现成功提示'}",
+        f"🕐 运行: {beijing_time_str()} (UTC+8)",
+        "",
+        status,
     ])
+    if project_name:
+        suffix = f" ({service_id})" if service_id else ''
+        lines.append(f"📦 服务: {project_name}{suffix}")
+    if power_note:
+        lines.append(power_note)
+    lines.extend(detail)
+    if detail_url:
+        lines.append(f"🔗 {detail_url}")
     return "\n".join(lines)
+
+def build_success_message(project_name, old_expiry, new_expiry, service_id='', detail_url='',
+                          power_note=''):
+    if old_expiry and old_expiry != '未知' and old_expiry != new_expiry:
+        expiry = f"⏳ 过期: {old_expiry} → {new_expiry}"
+    else:
+        expiry = f"⏳ 过期: {new_expiry}"
+    return build_message('✅ 续期成功', [expiry], project_name, service_id, detail_url, power_note)
+
+def build_not_yet_due_message(project_name, expiry, service_id='', detail_url='', power_note=''):
+    return build_message(
+        '⏳ 未到续期时间',
+        [f"⏳ 当前过期: {expiry}"],
+        project_name, service_id, detail_url, power_note,
+    )
+
+def build_unconfirmed_message(project_name, old_expiry, new_expiry, result_note,
+                              service_id='', detail_url='', power_note=''):
+    if old_expiry and old_expiry.lower() not in ['suspended', 'paused', '暂停'] \
+            and old_expiry != new_expiry:
+        expiry = f"⏳ 过期: {old_expiry} → {new_expiry}"
+    else:
+        expiry = f"⏳ 当前过期: {new_expiry}"
+    return build_message(
+        '❌ 续期状态未确认',
+        [expiry, f"📝 页面提示: {result_note or '未发现成功提示'}"],
+        project_name, service_id, detail_url, power_note,
+    )
+
+def build_alert_message(title, note='', project_name='', service_id='', detail_url=''):
+    detail = [f"📝 {note}"] if note else []
+    return build_message(
+        f"⚠️ {title}", detail, project_name, service_id, detail_url or PROJECTS_URL,
+    )
 
 def js_set_input_value(sb, selector, value):
     sb.execute_script(
@@ -965,6 +1065,7 @@ def get_current_ip(proxy_server: str = "") -> str:
     return response.text.strip()
 
 def main():
+    global EXIT_IP
 
     IS_PROXY = os.environ.get("IS_PROXY", "false").lower() == "true"
     PROXY_SERVER = os.getenv('S5_PROXY') or os.getenv('PROXY_SERVER') or "socks://127.0.0.1:1080"
@@ -979,6 +1080,7 @@ def main():
     with SB(**sb_options) as sb:   # 本地调试 headless=False，CI 改为 True
         try:
             ip = get_current_ip(PROXY_SERVER if IS_PROXY else "")
+            EXIT_IP = ip
             print(f"📍 当前出口IP: {ip}")
         except Exception as e:
             print(f"获取出口IP失败: {e}")
@@ -995,10 +1097,13 @@ def main():
 
         if is_login_page(sb):
             if not EMAIL or not PASSWORD:
-                print("❌ 未配置 ACL_EMAIL 或 ACL_PASSWORD，无法执行账号密码登录。")
-                send_telegram("⚠️ 未配置 ACL_EMAIL 或 ACL_PASSWORD。")
+                print("❌ 未配置 EMAIL 或 PASSWORD，无法执行账号密码登录。")
+                send_telegram(build_alert_message('未配置登录凭据', '缺少环境变量 EMAIL / PASSWORD'))
                 return
             if not login(sb, EMAIL, PASSWORD):
+                send_telegram(build_alert_message(
+                    '登录失败', '提交后未离开登录页，请检查账号密码或人机验证',
+                    detail_url=BASE_URL + LOGIN_PATH))
                 return
             # 登录成功后重新进入项目页
             sb.open(PROJECTS_URL)
@@ -1006,7 +1111,8 @@ def main():
             time.sleep(2)
         elif not is_logged_in(sb):
             print(f"❌ 未能确认登录状态。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
-            send_telegram("⚠️ 未能确认登录状态，请检查账号密码配置。")
+            send_telegram(build_alert_message(
+                '未能确认登录状态', f"当前 URL: {sb.get_current_url()}"))
             return
         else:
             print(f"✅ 当前已登录。URL: {sb.get_current_url()}，标题: {sb.get_title()}")
@@ -1023,7 +1129,9 @@ def main():
         if not rows:
             print("❌ 未找到项目卡片。")
             log_projects_page_diagnostics(sb)
-            send_telegram("⚠️ 未找到项目卡片，请检查页面结构。")
+            send_telegram(build_alert_message(
+                '未找到服务列表',
+                '列表页上没有任何 data-service-id 服务行，请检查页面结构是否又改版'))
             return
 
         projects = []
@@ -1035,7 +1143,7 @@ def main():
                 'service_id': service_id,
                 'name': get_project_name(row, idx),
                 'expiry': get_project_expiry(row),
-                'detail_url': get_detail_url(row) or f'{BASE_URL}/server/{service_id}',
+                'detail_url': get_detail_url(row),
             })
 
         print(f"找到 {len(projects)} 个项目卡片。")
@@ -1043,20 +1151,31 @@ def main():
             service_id = project['service_id']
             project_name = project['name']
             old_expiry = project['expiry']
+            detail_url = project['detail_url']
             try:
-                print(f"[{project_name}] 当前过期: {old_expiry}，详情页: {project['detail_url']}")
+                print(f"[{project_name}] 当前过期: {old_expiry}，详情页: {detail_url or '未找到'}")
 
-                # 续期入口只在服务详情页：列表页也渲染了 Renew 按钮，但站点用
-                # CSS `article[data-service-id] a[href^="/server/"] + button
-                # { display: none !important }` 把它藏了，点不到。
-                sb.open(project['detail_url'])
+                # data-service-id 是短 id，和详情页的完整 UUID 不同，不能拼 URL
+                if not detail_url:
+                    print(f"[{project_name}] 服务行里没有详情页链接，跳过")
+                    send_telegram(build_alert_message(
+                        '缺少详情页链接', '服务行里没有 /server/ 或 /dashboard/vps/ 链接',
+                        project_name, service_id))
+                    continue
+
+                # 续期入口只在服务详情页；列表页的 Renew 按钮（2026-09 表格版）
+                # 被站点 CSS 隐藏，点不到。
+                sb.open(detail_url)
                 sb.wait_for_ready_state_complete()
                 if not wait_for_detail_page(sb):
                     print(f"[{project_name}] 详情页未渲染完成，跳过")
                     send_telegram(build_unconfirmed_message(
-                        project_name, old_expiry, old_expiry, '详情页未渲染完成'))
+                        project_name, old_expiry, old_expiry, '详情页未渲染完成',
+                        service_id, detail_url))
                     continue
 
+                # 离线时先把服务拉起来（免费实例停久了会被关掉）
+                power_note = ensure_server_started(sb, project_name)
                 before_lines = page_text_lines(sb)
                 renew_btn = find_renew_buttons(find_main(sb))
 
@@ -1069,17 +1188,22 @@ def main():
                     if success:
                         new_expiry = read_project_expiry(sb, service_id) or old_expiry
                         print(f"续期成功！状态: {result_note or 'Renew 按钮已消失'}，新过期: {new_expiry}")
-                        send_telegram(build_success_message(project_name, old_expiry, new_expiry))
+                        send_telegram(build_success_message(
+                            project_name, old_expiry, new_expiry, service_id, detail_url,
+                            power_note))
                     else:
                         send_telegram(build_unconfirmed_message(
-                            project_name, old_expiry, old_expiry, result_note))
+                            project_name, old_expiry, old_expiry, result_note,
+                            service_id, detail_url, power_note))
                 else:
                     # 详情页只有到了可续期时间才渲染 Renew 按钮
                     print(f"[{project_name}] 详情页没有 Renew 按钮，判定为未到续期时间")
-                    send_telegram(build_not_yet_due_message(project_name, old_expiry))
+                    send_telegram(build_not_yet_due_message(
+                        project_name, old_expiry, service_id, detail_url, power_note))
             except Exception as e:
                 print(f"处理卡片 {idx} 出错: {e}")
-                send_telegram(f"🇫🇷 Aclclouds 续期通知\n\n⚠️ 处理出错: {str(e)}")
+                send_telegram(build_alert_message(
+                    '处理服务出错', str(e), project_name, service_id, detail_url))
 
         print("所有项目处理完成。")
 
